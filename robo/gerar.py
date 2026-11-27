@@ -276,10 +276,12 @@ Regras:
 - A cena 1 é o GANCHO: em uma frase, o conflito e o que está em jogo. Nada de "olá" ou apresentação.
 - Cada cena traz uma escalada ou virada. {FINAIS.get(env('FINAL'), FINAIS['Pergunta pra comentar'])}
 - Personagens fictícios. Nada de pessoas reais, marcas reais, violência gráfica ou conteúdo adulto.
-- Para cada cena, "imagem": descrição VISUAL em inglês da cena (quem aparece, expressão, ação, lugar, enquadramento), sem texto escrito na imagem.
-- "personagem": descrição visual fixa, em inglês, do protagonista (idade, cabelo, roupa, traços), pra manter igual em todas as cenas.
+- Para cada cena, "imagem": descrição VISUAL em inglês da cena (quem aparece, expressão, ação, enquadramento), sem texto escrito na imagem. Chame cada personagem SEMPRE pelo mesmo nome do "elenco" (ex.: "Lucas", "Mia"); nunca escreva "he/she/the girl" sozinho. O protagonista aparece no máximo uma vez por imagem.
+- "personagem": descrição visual fixa, em inglês, do protagonista (nome, idade, cabelo, roupa, traços), pra manter igual em todas as cenas.
+- "elenco": os OUTROS personagens que aparecem (no máximo 3), cada um com "nome" e "visual" (descrição fixa em inglês: idade, cabelo, roupa, traços). Pode ser lista vazia.
+- "cenario": o lugar principal da história, descrito em inglês com detalhes fixos (tipo de lugar, cores, luz, objetos marcantes), pra todas as cenas parecerem no mesmo lugar. Se uma cena acontecer em outro lugar, diga o lugar dentro do "imagem".
 - "legenda": legenda do post em português com 2 a 3 frases curtas, um emoji, uma chamada pra comentar e 4 hashtags.
-Responda só em JSON: {{"titulo": str, "personagem": str, "cenas": [{{"fala": str, "imagem": str, "destaque": str}}], "legenda": str}}
+Responda só em JSON: {{"titulo": str, "personagem": str, "elenco": [{{"nome": str, "visual": str}}], "cenario": str, "cenas": [{{"fala": str, "imagem": str, "destaque": str}}], "legenda": str}}
 ("destaque" é a palavra mais forte da fala)."""
     h = gemini_texto(prompt)
     h['cenas'] = h['cenas'][:n]
@@ -304,7 +306,11 @@ def _ref(caminho):
     b = io.BytesIO(); im.save(b, 'PNG'); return b.getvalue()
 
 
-def cf_imagem(prompt, w, h, refs=(), seed=None):
+class ImagemRecusada(RuntimeError):
+    pass
+
+
+def _cf_chamar(prompt, w, h, refs, seed):
     conta, token = env('CF_ACCOUNT_ID'), env('CF_API_TOKEN')
     campos = {'prompt': prompt, 'width': w, 'height': h}
     if seed is not None:
@@ -317,7 +323,7 @@ def cf_imagem(prompt, w, h, refs=(), seed=None):
             if 'json' in ct:
                 img = (json.loads(bruto).get('result') or {}).get('image')
                 if not img:
-                    raise RuntimeError('resposta sem imagem')
+                    raise ImagemRecusada('resposta sem imagem')
                 return base64.b64decode(img)
             return bruto
         except urllib.error.HTTPError as e:
@@ -327,9 +333,35 @@ def cf_imagem(prompt, w, h, refs=(), seed=None):
                 raise RuntimeError('A cota grátis de imagens de hoje acabou. Ela renova às 21h (horário de Brasília).')
             if e.code in (401, 403):
                 raise RuntimeError('O token da Cloudflare foi recusado. Refaça o passo 2 da ativação.')
+            if e.code in (400, 413, 422):
+                raise ImagemRecusada(f'HTTP {e.code} {msg[:120]}')   # pedido recusado: não adianta repetir igual
             if t < 2:
                 time.sleep(15 * (t + 1)); continue
-            raise RuntimeError(f'Cloudflare respondeu HTTP {e.code}')
+            raise RuntimeError(f'O gerador de imagens da Cloudflare está instável agora (HTTP {e.code}). Tente de novo em alguns minutos.')
+        except (urllib.error.URLError, TimeoutError) as e:
+            if t < 2:
+                time.sleep(10); continue
+            raise RuntimeError(f'O gerador de imagens da Cloudflare não respondeu ({e}). Tente de novo em alguns minutos.')
+
+
+def _simplificar(prompt):
+    """Prompt mais curto e neutro (o gerador recusa pedido longo demais ou com palavra sensível)."""
+    p = re.sub(r'\s+', ' ', prompt)
+    p = re.sub(r'(?i)\b(blood\w*|gun\w*|weapon\w*|knife|kill\w*|dead|death|naked|nude|sexy|drunk|drugs?|beer|alcohol|cigarett\w*|violen\w*|fight\w*|punch\w*)\b', '', p)
+    return p[:700]
+
+
+def cf_imagem(prompt, w, h, refs=(), seed=None):
+    """Gera a imagem. Se a Cloudflare recusar (HTTP 400), tenta de novo com prompt menor, sem referência e outra seed."""
+    tentativas = [(prompt, refs, seed), (_simplificar(prompt), refs, seed), (_simplificar(prompt), (), (seed or 0) + 7777),
+                  (_simplificar(prompt)[:350], (), (seed or 0) + 31)]
+    ultimo = None
+    for n, (p, r, sd) in enumerate(tentativas):
+        try:
+            return _cf_chamar(p, w, h, r, sd)
+        except ImagemRecusada as e:
+            ultimo = e; log(f'   imagem recusada (tentativa {n + 1}), ajustando o pedido: {e}')
+    raise ImagemRecusada(f'o gerador recusou essa imagem ({ultimo})')
 
 
 PASTA_3D = RAIZ / 'r3d'
@@ -357,6 +389,18 @@ def preparar_3d():
     log('motor 3D pronto')
 
 
+def prompt_cena(h, c, arte):
+    """Prompt de uma cena com continuidade: mesmo cenário, mesmo protagonista e os outros personagens sempre iguais."""
+    cena = c.get('imagem', '')
+    outros = [e for e in (h.get('elenco') or []) if isinstance(e, dict) and e.get('nome') and e.get('nome', '').lower() in cena.lower()]
+    partes = [f"{arte}. Vertical 9:16 frame. Scene: {cena}.", "Full detailed background environment (never a plain or studio background).",
+              f"Setting: {h['cenario']}." if h.get('cenario') else '',
+              f"Main character, appears only ONCE in the image, looks exactly like the reference image (use the reference only for the character, not for the background): {h['personagem']}.",
+              ' '.join(f"{e['nome']}: {e.get('visual', '')}." for e in outros),
+              "Each character appears only once, no duplicates, no clones. No text, no letters, no watermark."]
+    return ' '.join(x for x in partes if x)
+
+
 def imagens():
     h = json.loads((SAIDA / 'historia.json').read_text(encoding='utf-8'))
     if env('ESTILO') in ESTILOS_3D:
@@ -365,12 +409,28 @@ def imagens():
     arte = ARTES.get(env('ARTE', 'Cartoon 2D'), ARTES['Cartoon 2D'])
     seed = sum(map(ord, h['titulo'])) % 100000
     ref = SAIDA / 'personagem.png'
-    ref.write_bytes(cf_imagem(f"{arte}. Character reference, single character, full body, neutral pose, plain light background. {h['personagem']}", 768, 768, seed=seed))
-    log('personagem ok')
+    try:
+        ref.write_bytes(cf_imagem(f"{arte}. Character reference, single character, full body, neutral pose, plain light background. {h['personagem']}", 768, 768, seed=seed))
+        refs = [ref]
+        log('personagem ok')
+    except ImagemRecusada as e:
+        refs = []; log('   personagem recusado, sigo sem referência:', e)
+    feitas = []
     for i, c in enumerate(h['cenas']):
-        p = f"{arte}. Vertical 9:16 frame. Main character (exactly as in the reference image, same face, same hair, same clothes and colors in every scene): {h['personagem']}. Scene: {c['imagem']}. No text, no letters, no watermark."
-        (SAIDA / f'cena_{i:02d}.png').write_bytes(cf_imagem(p, 720, 1280, refs=[ref], seed=seed + i + 1))
-        log(f'cena {i + 1}/{len(h["cenas"])} ok')
+        p = prompt_cena(h, c, arte)
+        destino = SAIDA / f'cena_{i:02d}.png'
+        try:
+            destino.write_bytes(cf_imagem(p, 720, 1280, refs=refs, seed=seed + i + 1))
+            feitas.append(destino); log(f'cena {i + 1}/{len(h["cenas"])} ok')
+        except ImagemRecusada as e:
+            log(f'   cena {i + 1} recusada, vou reaproveitar outra cena:', e)
+    if not feitas:
+        raise RuntimeError('O gerador de imagens recusou todas as cenas dessa história. Tente outro tema ou mude o estilo do desenho.')
+    for i in range(len(h['cenas'])):   # cena recusada usa a cena anterior (ou a seguinte) pro vídeo sair inteiro
+        destino = SAIDA / f'cena_{i:02d}.png'
+        if not destino.exists():
+            antes = [f for f in feitas if int(f.stem[-2:]) < i]
+            destino.write_bytes((antes[-1] if antes else feitas[0]).read_bytes())
 
 
 VOZES = {'Masculina': 'Puck', 'Feminina': 'Kore', 'Grave de suspense': 'Charon', 'Jovem animada': 'Leda'}
